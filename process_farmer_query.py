@@ -50,7 +50,7 @@ SCHEME_SERVICE_URL = os.getenv(
     "SCHEME_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/query-government-schemes"
 )
 CROP_SERVICE_URL = os.getenv(
-    "CROP_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/ask-consultant"
+    "CROP_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/ask-with-image"
 )
 
 # Initialize Gemini model for intent classification (only if key looked valid)
@@ -90,11 +90,17 @@ def _rule_based_intent(query: str) -> Literal["scheme", "crop", "both", "none"] 
 
 def supervisor_node(state):
     query = state.get("text", "").strip()
-    print(f"[Supervisor] In supervisor node. Query: {query!r}")
+    image_url = state.get("imageUrl")
+    print(f"[Supervisor] In supervisor node. Query: {query!r}, ImageUrl: {image_url!r}")
     
-    # Handle empty/null queries
+    # Handle case where there's only an image but no text
+    if not query and image_url:
+        print("[Supervisor] Image provided without text – defaulting to 'crop' intent (images typically used for crop disease/pest identification).")
+        return {**state, "intent": "crop", "entities": {}}
+    
+    # Handle empty/null queries with no image
     if not query:
-        print("[Supervisor] Empty query received – skipping classification.")
+        print("[Supervisor] Empty query received and no image – skipping classification.")
         return {**state, "intent": None, "entities": {}}
     
     # If Gemini is not available, use rule-based classifier and avoid noisy config errors
@@ -104,7 +110,37 @@ def supervisor_node(state):
         return {**state, "intent": intent, "entities": {}}
 
     # LLM classifies intent (only when Gemini is healthy)
-    prompt = f"""Classify the following farmer query into one of these intents: "scheme", "crop", "both" or "none".
+    # If there's an image, include it in the classification
+    prompt_parts = []
+    
+    # Add image if available
+    if image_url:
+        try:
+            import base64
+            import mimetypes
+            
+            # Download the image
+            with httpx.Client() as client:
+                img_response = client.get(image_url, timeout=10.0)
+                img_response.raise_for_status()
+                image_data = img_response.content
+            
+            # Determine MIME type
+            mime_type, _ = mimetypes.guess_type(image_url)
+            if not mime_type:
+                mime_type = "image/jpeg"  # Default fallback
+            
+            # Add image to prompt
+            prompt_parts.append({
+                "mime_type": mime_type,
+                "data": base64.b64encode(image_data).decode()
+            })
+            print(f"[Supervisor] Image loaded for classification: {mime_type}")
+        except Exception as e:
+            print(f"[Supervisor] Warning: Could not load image for classification: {e}. Proceeding with text-only classification.")
+    
+    # Add text prompt
+    text_prompt = f"""Classify the following farmer query into one of these intents: "scheme", "crop", "both" or "none".
 
 Query: {query}
 
@@ -119,9 +155,11 @@ Examples:
 2. Query : "What is Citrus Canker?", intent : "crop",
 3. Query : "Tell me what government schemes help me to address citrus canker?", intent : "both"
 Respond with ONLY one word: scheme, crop, both, or none."""
+    
+    prompt_parts.append(text_prompt)
 
     try:
-        response = gemini_model.generate_content(prompt)
+        response = gemini_model.generate_content(prompt_parts)
         raw_text = (response.text or "")
         print(f"[Supervisor] Raw Gemini response: {raw_text!r}")
         intent = raw_text.strip().lower()
@@ -164,18 +202,34 @@ async def scheme_node(state):
 
 async def crop_node(state):
     query = state.get("text", "")
-    print(f"in crop node. query: {query}")
+    image_url = state.get("imageUrl")
+    print(f"in crop node. query: {query}, imageUrl: {image_url}")
     
     try:
         async with httpx.AsyncClient() as client:
+            # Prepare multipart form data
+            data = {
+                "query": query,
+            }
+            
+            # Add mediaUrl if provided
+            if image_url:
+                data["mediaUrl"] = image_url
+            
+            # For now, we're not handling file upload (binary file)
+            # If you need to download and upload the image file, additional logic would be needed
+            
             response = await client.post(
                 CROP_SERVICE_URL,
-                json={"query": query},
+                data=data,
                 timeout=30.0
             )
             response.raise_for_status()
             crop_response = response.json()
     except Exception as e:
+        import traceback
+        print(f"[Crop Node] Error calling crop service: {e}")
+        traceback.print_exc()
         crop_response = {"error": str(e)}
     
     return {**state, "crop_response": crop_response}
