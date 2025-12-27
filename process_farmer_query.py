@@ -330,42 +330,87 @@ Farmer query:
 # Collector (LLM Synthesis)
 # -------------------------------------------------------------------
 
-def synthesize_final_response(scheme: dict | None, crop: dict | None) -> str:
+def synthesize_final_response(
+    intent: Literal["scheme", "crop", "both"] | None,
+    scheme: dict | None,
+    crop: dict | None,
+) -> str:
     """
-    Combines scheme + crop responses into one final answer.
+    Produces the final farmer-facing response based on intent.
+    - scheme  → scheme only
+    - crop    → crop only
+    - both    → intelligently combine
     """
+
     scheme_text = scheme.get("response") if isinstance(scheme, dict) else None
     crop_text = crop.get("response") if isinstance(crop, dict) else None
 
-    if not COLLECTOR_MODEL:
-        return "\n\n".join(filter(None, [crop_text, scheme_text])) or "No information available."
+    # -------------------------
+    # Intent-driven shortcuts
+    # -------------------------
+    if intent == "crop":
+        return crop_text or "No crop advisory information available."
 
+    if intent == "scheme":
+        return scheme_text or "No government scheme information available."
+
+    # intent == "both" or unknown → combine
+    if not COLLECTOR_MODEL:
+        return (
+            "\n\n".join(filter(None, [crop_text, scheme_text]))
+            or "No information available."
+        )
+
+    # -------------------------
+    # LLM synthesis for BOTH
+    # -------------------------
     prompt = f"""
-Combine the following into ONE helpful farmer response.
+You are an agricultural assistant responding to a farmer.
+
+Combine the following information into ONE clear, helpful response.
+
+Rules:
+- Do NOT repeat information.
+- Clearly separate crop advice vs government support.
+- If one section is missing, answer with what is available.
+- Use simple, farmer-friendly language.
 
 Crop Advisory:
 {crop_text or "N/A"}
 
 Government Schemes:
 {scheme_text or "N/A"}
+
+Final Answer:
 """
 
     try:
         r = COLLECTOR_MODEL.generate_content(prompt)
         return (r.text or "").strip()
     except Exception:
-        return "\n\n".join(filter(None, [crop_text, scheme_text])) or "No information available."
-
+        return (
+            "\n\n".join(filter(None, [crop_text, scheme_text]))
+            or "No information available."
+        )
 
 def collector_node(state):
+    """
+    Final aggregation node.
+    Delegates decision-making to synthesize_final_response based on intent.
+    """
+    intent = state.get("intent")
+
     final_answer = synthesize_final_response(
-        state.get("scheme_response"),
-        state.get("crop_response"),
+        intent=intent,
+        scheme=state.get("scheme_response"),
+        crop=state.get("crop_response"),
     )
 
     return {
         **state,
-        "service_response": {"response": final_answer}
+        "service_response": {
+            "response": final_answer
+        }
     }
 
 
